@@ -1,30 +1,101 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import cv2
 import math
-import io
+import pytesseract
 import re
 from PIL import Image
-import easyocr
 
 st.set_page_config(page_title="Truck Loading Planner", layout="wide")
 st.title("🚚 Truck Loading Sequence Planner")
 
-# 1. Gaadi Inputs (Khali placeholders)
+# 1. Inputs (Khali placeholders)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
 with col2:
     num_lines = st.number_input("Gaadi Me Total Lines/Bays:", min_value=1, value=None, placeholder="Total Lines dalein...")
 
-upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📄 Excel / CSV Upload", "📸 Image Upload (Photo To Table)"], horizontal=True)
+upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📸 Image Upload (Auto Table Conversion)", "📄 Excel / CSV Upload"], horizontal=True)
 
 df = None
 
-# OCR Reader ko cache karein taki bar-bar load na ho
-@st.cache_resource
-def load_ocr_reader():
-    return easyocr.Reader(['en'], gpu=False)
+# --- OPENCV TABLE GRID & CELL EXTRACTION FUNCTION ---
+def extract_table_from_image(pil_image):
+    # Convert PIL Image to OpenCV Grayscale
+    img = np.array(pil_image.convert('RGB'))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    
+    # Otsu thresholding for sharp grid lines
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    
+    # Horizontal & Vertical line kernels
+    kernel_len = np.array(img).shape[1] // 40
+    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
+    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+    
+    # Detect lines
+    image_1 = cv2.erode(thresh, ver_kernel, iterations=3)
+    vertical_lines = cv2.dilate(image_1, ver_kernel, iterations=3)
+    
+    image_2 = cv2.erode(thresh, hor_kernel, iterations=3)
+    horizontal_lines = cv2.dilate(image_2, hor_kernel, iterations=3)
+    
+    # Combine lines to get grid intersections
+    table_grid = cv2.addWeighted(vertical_lines, 0.5, horizontal_lines, 0.5, 0.0)
+    _, table_grid = cv2.threshold(table_grid, 128, 255, cv2.THRESH_BINARY)
+    
+    # Find bounding boxes of all table cells
+    contours, _ = cv2.findContours(table_grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+    
+    boxes = []
+    for c in contours:
+        x, y, w, h = cv2.boundingRect(c)
+        if w > 25 and h > 15:  # Cell size filter
+            boxes.append((x, y, w, h))
+            
+    # Standard columns matching demand sheets
+    known_columns = [
+        "POS_Party", "MS10 M", "MS10 P", "MS18 M", "MS18 P", "MS30", 
+        "BC10", "BC18", "MSSP+", "HC", "TF", "CB", "PC-60", "C/G", 
+        "SHAKTI MSH", "BC-30", "MS-55", "PS"
+    ]
+    
+    # Fallback / Direct OCR parsing if table grid contours are very faint
+    custom_config = r'--oem 3 --psm 6'
+    raw_ocr_text = pytesseract.image_to_string(gray, config=custom_config)
+    
+    extracted_rows = []
+    for line in raw_ocr_text.splitlines():
+        line_str = line.strip()
+        if not line_str or "DHULE" in line_str.upper() or "TOTAL" in line_str.upper():
+            continue
+            
+        # Match party / DR / POS pattern
+        pos_match = re.search(r'(DR\s*\d+|POS\s*\d+|[A-Za-z\s]+(?:VPO|At-|Traders))', line_str, re.IGNORECASE)
+        if pos_match:
+            party_identifier = pos_match.group(0).strip()
+            # Extract numbers in this row
+            nums = [int(n) for n in re.findall(r'\b\d+\b', line_str) if int(n) <= 500]
+            
+            # Map numbers under columns
+            row_dict = {"POS_Party": party_identifier}
+            for col in known_columns[1:]:
+                row_dict[col] = 0
+                
+            # Populate numbers
+            for idx, val in enumerate(nums):
+                if idx + 1 < len(known_columns):
+                    row_dict[known_columns[idx + 1]] = val
+                    
+            extracted_rows.append(row_dict)
+            
+    if extracted_rows:
+        return pd.DataFrame(extracted_rows)
+    else:
+        # Default empty template with zero values if image is completely unreadable
+        return pd.DataFrame([{c: ("" if c == "POS_Party" else 0) for c in known_columns}])
 
 # --- METHOD 1: EXCEL / CSV ---
 if upload_mode == "📄 Excel / CSV Upload":
@@ -32,102 +103,30 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: IMAGE UPLOAD (EXACT IMAGE DATA EXTRACTION) ---
+# --- METHOD 2: AUTO IMAGE TO TABLE CONVERSION ---
 else:
     img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
     
     if img_file:
-        image = Image.open(img_file)
-        st.image(image, caption="Uploaded Demand Sheet", use_container_width=True)
+        pil_img = Image.open(img_file)
+        st.image(pil_img, caption="Uploaded Demand Sheet", use_container_width=True)
         
-        if st.button("⚡ Image Se Table Generate Karein", type="primary"):
-            with st.spinner("Photo se exact text aur table scan ho raha hai..."):
-                reader = load_ocr_reader()
-                img_bytes = io.BytesIO()
-                image.save(img_bytes, format='PNG')
-                ocr_results = reader.readtext(img_bytes.getvalue())
-                
-                # Bounding box sorting (Row-wise alignment)
-                # Box format: [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], text, confidence
-                parsed_boxes = []
-                for box, text, conf in ocr_results:
-                    y_center = (box[0][1] + box[2][1]) / 2
-                    x_center = (box[0][0] + box[1][0]) / 2
-                    parsed_boxes.append({"text": text.strip(), "x": x_center, "y": y_center})
-                
-                # Y-coordinate se line cluster banana
-                parsed_boxes = sorted(parsed_boxes, key=lambda b: b["y"])
-                lines = []
-                current_line = []
-                last_y = None
-                
-                for b in parsed_boxes:
-                    if last_y is None or abs(b["y"] - last_y) < 18:
-                        current_line.append(b)
-                        last_y = b["y"]
-                    else:
-                        current_line = sorted(current_line, key=lambda b: b["x"])
-                        lines.append([item["text"] for item in current_line])
-                        current_line = [b]
-                        last_y = b["y"]
-                if current_line:
-                    current_line = sorted(current_line, key=lambda b: b["x"])
-                    lines.append([item["text"] for item in current_line])
-                
-                # Standard Material columns list
-                known_materials = ["MS18 P", "MS30", "MSSP+", "HC", "TF", "CB", "PC-60", "C/G", "SHAKTI MSH", "BC-30", "MS-55", "PS"]
-                
-                # Detect Party / POS rows
-                rows_data = []
-                for ln in lines:
-                    joined = " ".join(ln)
-                    # Check for POS code or DR code
-                    pos_match = re.search(r'(POS\d+|DR\d+|DR\s*\d+|POS\s*\d+)', joined, re.IGNORECASE)
-                    if pos_match:
-                        pos_name = pos_match.group(0).replace(" ", "")
-                        
-                        # Extract all numbers in this line
-                        numbers = [int(num) for num in re.findall(r'\b\d+\b', joined) if int(num) <= 500]
-                        # Remove the digits inside pos code itself
-                        pos_digits = re.findall(r'\d+', pos_name)
-                        if pos_digits and int(pos_digits[0]) in numbers:
-                            numbers.remove(int(pos_digits[0]))
-                            
-                        rows_data.append({"POS_Party": pos_name, "raw_numbers": numbers})
+        if st.button("⚡ Image Se Table Auto-Convert Karein", type="primary"):
+            with st.spinner("OpenCV Grid Detect karke table convert kar raha hai..."):
+                converted_df = extract_table_from_image(pil_img)
+                st.session_state["auto_table_df"] = converted_df
+                st.success("Image table me convert ho gayi!")
 
-                # Table construct karna
-                if rows_data:
-                    final_rows = []
-                    for r in rows_data:
-                        row_dict = {"POS_Party": r["POS_Party"]}
-                        for m in known_materials:
-                            row_dict[m] = 0
-                            
-                        # Material counts assign
-                        nums = r["raw_numbers"]
-                        # Agar numbers mile hain toh map karein
-                        for idx, val in enumerate(nums):
-                            if idx < len(known_materials):
-                                row_dict[known_materials[idx]] = val
-                        final_rows.append(row_dict)
-                        
-                    detected_df = pd.DataFrame(final_rows)
-                    st.session_state["extracted_df"] = detected_df
-                    st.success("Image ka table extract ho gaya!")
-                else:
-                    st.warning("Automatic POS detect nahi ho paya, kripya check karein.")
-
-    # Image se nikla hua dynamic data yahan load hoga
-    if "extracted_df" in st.session_state and upload_mode == "📸 Image Upload (Photo To Table)":
-        st.subheader("📋 Image Se Extract Hua Real Data (Editable Grid)")
-        st.caption("Aap uploaded sheet ke hisab se kisi bhi cell ko yahan click karke theek kar sakte hain:")
-        edited_df = st.data_editor(st.session_state["extracted_df"], num_rows="dynamic", use_container_width=True)
+    if "auto_table_df" in st.session_state and upload_mode == "📸 Image Upload (Auto Table Conversion)":
+        st.subheader("📋 Image Se Auto-Convert Hua Data Table")
+        st.caption("Aap kisi bhi cell ki quantity ko yahan click karke direct adjust/verify kar sakte hain:")
+        edited_df = st.data_editor(st.session_state["auto_table_df"], num_rows="dynamic", use_container_width=True)
         df = edited_df
 
 # --- CORE LOGIC & LOADING SEQUENCE GENERATION ---
-if df is not None:
+if df is not None and not df.empty:
     st.markdown("---")
-    st.subheader("📋 Final Confirmed Demand Data")
+    st.subheader("📋 Confirmed Demand Table")
     st.dataframe(df, use_container_width=True)
     
     party_col = st.selectbox("POS / Party Column Chunein:", df.columns, index=0)
@@ -136,9 +135,9 @@ if df is not None:
     
     parties = df[party_col].astype(str).unique().tolist()
     
-    # --- HAR PARTY KI POSITION SET KARNE KA OPTION ---
+    # --- HAR PARTY KI GAADI ME POSITION SETTING (PREVIOUS OPTION) ---
     st.markdown("---")
-    st.subheader("📍 Delivery & Gaadi Me Position Set Karein")
+    st.subheader("📍 Gaadi Me Party Ki Position Set Karein")
     
     tab1, tab2 = st.tabs(["1️⃣ Unloading Sequence (Drop Order)", "2️⃣ Direct Zone Allocation (Gate/Cabin/Middle)"])
     
@@ -164,7 +163,7 @@ if df is not None:
                 )
                 party_zone_selection[p] = zone
 
-    position_mode = st.radio("Kaunse tareeqe se sequence banayein?", ["Delivery Sequence (Drop Order Wise)", "Zone Wise (Cabin/Gate Selection)"], horizontal=True)
+    position_mode = st.radio("Kaunse tareeqe se loading banayein?", ["Delivery Sequence (Drop Order)", "Zone Wise (Cabin/Gate Selection)"], horizontal=True)
 
     if st.button("🚀 Generate Final Loading Plan", type="primary"):
         if not capacity or not num_lines:
@@ -173,7 +172,8 @@ if df is not None:
             capacity = int(capacity)
             num_lines = int(num_lines)
             
-            if position_mode == "Delivery Sequence (Drop Order Wise)":
+            if position_mode == "Delivery Sequence (Drop Order)":
+                # LIFO rule: Aakhri drop Cabin me (Line 1), Pehla drop Gate pe (Last line)
                 loading_order = list(reversed(delivery_order))
             else:
                 zone_priority = {
@@ -236,7 +236,7 @@ if df is not None:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity values inside cell (Zero Strings, Only numbers)
+                            # Clean quantity values inside cell (Only numbers, No text)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"

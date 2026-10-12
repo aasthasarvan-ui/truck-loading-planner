@@ -71,7 +71,7 @@ else:
                         Exclude any totals or empty items.
                         """
                         # Models list to ensure fallback works seamlessly without 404
-                        models_to_try = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-1.5-flash"]
+                        models_to_try = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3.8-flash"]
                         response = None
                         last_err = None
 

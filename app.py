@@ -10,7 +10,7 @@ from PIL import Image
 st.set_page_config(page_title="Truck Loading Planner", layout="wide")
 st.title("🚚 Truck Loading Sequence Planner")
 
-# 1. Inputs (Khali placeholders)
+# 1. Inputs (Khali placeholders, user khud bharega)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
@@ -21,80 +21,73 @@ upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📸 Image Upload 
 
 df = None
 
-# --- OPENCV TABLE GRID & CELL EXTRACTION FUNCTION ---
+# --- HIGH ACCURACY TABLE OCR PREPROCESSING ---
 def extract_table_from_image(pil_image):
-    # Convert PIL Image to OpenCV Grayscale
+    # Convert PIL to CV2 array
     img = np.array(pil_image.convert('RGB'))
-    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
     
-    # Otsu thresholding for sharp grid lines
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    # 1. Image Upscaling (2.5x) - Chote font ko bada aur readable banane ke liye
+    h, w = img.shape[:2]
+    img_resized = cv2.resize(img, (int(w * 2.5), int(h * 2.5)), interpolation=cv2.INTER_CUBIC)
     
-    # Horizontal & Vertical line kernels
-    kernel_len = np.array(img).shape[1] // 40
-    ver_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (1, kernel_len))
-    hor_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_len, 1))
+    # 2. Grayscale & Contrast Enhancement (CLAHE)
+    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast = clahe.apply(gray)
     
-    # Detect lines
-    image_1 = cv2.erode(thresh, ver_kernel, iterations=3)
-    vertical_lines = cv2.dilate(image_1, ver_kernel, iterations=3)
+    # 3. Clean Sharp Binarization (Otsu threshold)
+    thresh = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
     
-    image_2 = cv2.erode(thresh, hor_kernel, iterations=3)
-    horizontal_lines = cv2.dilate(image_2, hor_kernel, iterations=3)
-    
-    # Combine lines to get grid intersections
-    table_grid = cv2.addWeighted(vertical_lines, 0.5, horizontal_lines, 0.5, 0.0)
-    _, table_grid = cv2.threshold(table_grid, 128, 255, cv2.THRESH_BINARY)
-    
-    # Find bounding boxes of all table cells
-    contours, _ = cv2.findContours(table_grid, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
-    
-    boxes = []
-    for c in contours:
-        x, y, w, h = cv2.boundingRect(c)
-        if w > 25 and h > 15:  # Cell size filter
-            boxes.append((x, y, w, h))
-            
-    # Standard columns matching demand sheets
+    # Standard Cattle Feed Material Columns
     known_columns = [
         "POS_Party", "MS10 M", "MS10 P", "MS18 M", "MS18 P", "MS30", 
         "BC10", "BC18", "MSSP+", "HC", "TF", "CB", "PC-60", "C/G", 
         "SHAKTI MSH", "BC-30", "MS-55", "PS"
     ]
     
-    # Fallback / Direct OCR parsing if table grid contours are very faint
-    custom_config = r'--oem 3 --psm 6'
-    raw_ocr_text = pytesseract.image_to_string(gray, config=custom_config)
-    
+    # 4. Tesseract OCR with Table Mode (--psm 6)
+    raw_text = pytesseract.image_to_string(thresh, config='--oem 3 --psm 6')
     extracted_rows = []
-    for line in raw_ocr_text.splitlines():
-        line_str = line.strip()
-        if not line_str or "DHULE" in line_str.upper() or "TOTAL" in line_str.upper():
+    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
+    
+    for line_str in lines:
+        upper_line = line_str.upper()
+        # Header aur footer summary rows ignore karein
+        if any(keyword in upper_line for keyword in ["DHULE", "TOTAL", "RECEIVED", "ACCOUNTS", "MOBILE", "NAME", "SR NO"]):
             continue
             
-        # Match party / DR / POS pattern
-        pos_match = re.search(r'(DR\s*\d+|POS\s*\d+|[A-Za-z\s]+(?:VPO|At-|Traders))', line_str, re.IGNORECASE)
-        if pos_match:
-            party_identifier = pos_match.group(0).strip()
-            # Extract numbers in this row
-            nums = [int(n) for n in re.findall(r'\b\d+\b', line_str) if int(n) <= 500]
+        # Party / DR code / POS dhoondhna
+        pos_search = re.search(r'(DR\s*[-_]?\s*\d+|POS\s*[-_]?\s*\d+|[A-Za-z]{3,}\s*(?:Traders|Feed|Pashu))', line_str, re.IGNORECASE)
+        
+        # Line me saare positive numbers collect karna
+        all_numbers = [int(n) for n in re.findall(r'\b\d+\b', line_str) if 0 < int(n) <= 650]
+        
+        if pos_search or len(all_numbers) >= 2:
+            party_name = pos_search.group(0).replace(" ", "").upper() if pos_search else f"Party_{len(extracted_rows)+1}"
             
-            # Map numbers under columns
-            row_dict = {"POS_Party": party_identifier}
-            for col in known_columns[1:]:
-                row_dict[col] = 0
-                
-            # Populate numbers
-            for idx, val in enumerate(nums):
-                if idx + 1 < len(known_columns):
-                    row_dict[known_columns[idx + 1]] = val
+            # Party code ke digits ko quantity se exclude karna (jaise DR19172 se 19172)
+            party_digits = re.findall(r'\d+', party_name)
+            if party_digits:
+                p_num = int(party_digits[0])
+                if p_num in all_numbers:
+                    all_numbers.remove(p_num)
                     
-            extracted_rows.append(row_dict)
-            
+            if all_numbers:
+                row_dict = {"POS_Party": party_name}
+                for c in known_columns[1:]:
+                    row_dict[c] = 0
+                
+                # Extracted numbers ko sequential material columns me place karna
+                for idx, val in enumerate(all_numbers):
+                    if idx + 1 < len(known_columns):
+                        row_dict[known_columns[idx + 1]] = val
+                        
+                extracted_rows.append(row_dict)
+                
     if extracted_rows:
         return pd.DataFrame(extracted_rows)
     else:
-        # Default empty template with zero values if image is completely unreadable
+        # Agar koi bhi row na mile toh blank structure dena
         return pd.DataFrame([{c: ("" if c == "POS_Party" else 0) for c in known_columns}])
 
 # --- METHOD 1: EXCEL / CSV ---
@@ -112,14 +105,14 @@ else:
         st.image(pil_img, caption="Uploaded Demand Sheet", use_container_width=True)
         
         if st.button("⚡ Image Se Table Auto-Convert Karein", type="primary"):
-            with st.spinner("OpenCV Grid Detect karke table convert kar raha hai..."):
+            with st.spinner("Image scan karke table convert kiya ja raha hai..."):
                 converted_df = extract_table_from_image(pil_img)
                 st.session_state["auto_table_df"] = converted_df
                 st.success("Image table me convert ho gayi!")
 
     if "auto_table_df" in st.session_state and upload_mode == "📸 Image Upload (Auto Table Conversion)":
         st.subheader("📋 Image Se Auto-Convert Hua Data Table")
-        st.caption("Aap kisi bhi cell ki quantity ko yahan click karke direct adjust/verify kar sakte hain:")
+        st.caption("Aap kisi bhi cell ki quantity ko click karke seedhe theek ya verify kar sakte hain:")
         edited_df = st.data_editor(st.session_state["auto_table_df"], num_rows="dynamic", use_container_width=True)
         df = edited_df
 
@@ -135,7 +128,7 @@ if df is not None and not df.empty:
     
     parties = df[party_col].astype(str).unique().tolist()
     
-    # --- HAR PARTY KI GAADI ME POSITION SETTING (PREVIOUS OPTION) ---
+    # --- HAR PARTY KI GAADI ME POSITION SETTING ---
     st.markdown("---")
     st.subheader("📍 Gaadi Me Party Ki Position Set Karein")
     
@@ -236,7 +229,7 @@ if df is not None and not df.empty:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity values inside cell (Only numbers, No text)
+                            # Clean quantity values inside cell (Only numbers, No strings/POS)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"

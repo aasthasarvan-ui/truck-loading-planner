@@ -3,7 +3,6 @@ import pandas as pd
 import math
 import json
 import io
-import time
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -18,7 +17,7 @@ if not api_key:
     import os
     api_key = os.environ.get("GEMINI_API_KEY", "")
 
-# 1. Inputs (No pre-filled defaults, completely clean)
+# 1. Inputs (Khali placeholders, koi default value nahi)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
@@ -29,7 +28,7 @@ upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📄 Excel / CSV U
 
 df = None
 
-# Helper: Fast image compression to fix slow / failing uploads on mobile
+# Fast Image Compression Helper (Upload fast aur smooth banane ke liye)
 def prepare_fast_image(uploaded_img):
     img = Image.open(uploaded_img)
     if img.mode in ("RGBA", "P"):
@@ -48,7 +47,7 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: IMAGE UPLOAD (LATEST GEMINI 3.8 FLASH OCR) ---
+# --- METHOD 2: IMAGE UPLOAD (SIRF GEMINI 3.8 FLASH) ---
 else:
     img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
     if img_file:
@@ -59,7 +58,7 @@ else:
             if not api_key:
                 st.error("Kripya sidebar me Gemini API Key dalein.")
             else:
-                with st.spinner("AI photo scan kar raha hai..."):
+                with st.spinner("Gemini 3.8 Flash photo scan kar raha hai..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         prompt = """
@@ -71,41 +70,20 @@ else:
                         Exclude any totals or empty items.
                         """
                         
-                        # Latest Gemini 3.8 Flash with auto-retry and multi-model fallback
-                        models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
-                        response = None
-                        success = False
-                        last_err = None
+                        # Sirf Gemini 3.8 Flash
+                        response = client.models.generate_content(
+                            model="gemini-3.8-flash",
+                            contents=[prompt, processed_img],
+                            config=types.GenerateContentConfig(response_mime_type="application/json")
+                        )
 
-                        for mod in models_to_try:
-                            for attempt in range(2):
-                                try:
-                                    response = client.models.generate_content(
-                                        model=mod,
-                                        contents=[prompt, processed_img],
-                                        config=types.GenerateContentConfig(response_mime_type="application/json")
-                                    )
-                                    if response and response.text:
-                                        success = True
-                                        break
-                                except Exception as e:
-                                    last_err = e
-                                    err_str = str(e)
-                                    if "503" in err_str or "UNAVAILABLE" in err_str:
-                                        time.sleep(2)
-                                        continue
-                                    else:
-                                        break
-                            if success:
-                                break
-
-                        if success and response and response.text:
+                        if response and response.text:
                             parsed_json = json.loads(response.text)
                             df = pd.DataFrame(parsed_json).fillna(0)
                             st.session_state["extracted_df"] = df
                             st.success("Data successfully extract ho gaya!")
                         else:
-                            st.error(f"Error aaya: {last_err}")
+                            st.error("Model se koi response nahi mila.")
 
                     except Exception as e:
                         st.error(f"Image scan karne me error: {e}")
@@ -208,7 +186,7 @@ if df is not None:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity values inside cell (No POS/DRCODE strings)
+                            # Clean quantity values inside cell (No strings / No POS / No DRCODE)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"

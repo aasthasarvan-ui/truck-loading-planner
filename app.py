@@ -1,94 +1,47 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-import cv2
 import math
-import pytesseract
-import re
+import json
+import io
+import time
 from PIL import Image
+from google import genai
+from google.genai import types
 
 st.set_page_config(page_title="Truck Loading Planner", layout="wide")
-st.title("🚚 Truck Loading Sequence Planner")
+st.title("🚚 Truck Loading Sequence Planner (Latest Gemini AI)")
 
-# 1. Inputs (Khali placeholders, user khud bharega)
+# Sidebar Settings
+st.sidebar.header("⚙️ Settings & API")
+api_key = st.sidebar.text_input("Gemini API Key:", type="password")
+if not api_key:
+    import os
+    api_key = os.environ.get("GEMINI_API_KEY", "")
+
+# Inputs (Blank placeholders, no pre-filled defaults)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
 with col2:
     num_lines = st.number_input("Gaadi Me Total Lines/Bays:", min_value=1, value=None, placeholder="Total Lines dalein...")
 
-upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📸 Image Upload (Auto Table Conversion)", "📄 Excel / CSV Upload"], horizontal=True)
+upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📸 Image Upload (AI Auto-Scan)", "📄 Excel / CSV Upload"], horizontal=True)
 
 df = None
 
-# --- HIGH ACCURACY TABLE OCR PREPROCESSING ---
-def extract_table_from_image(pil_image):
-    # Convert PIL to CV2 array
-    img = np.array(pil_image.convert('RGB'))
-    
-    # 1. Image Upscaling (2.5x) - Chote font ko bada aur readable banane ke liye
-    h, w = img.shape[:2]
-    img_resized = cv2.resize(img, (int(w * 2.5), int(h * 2.5)), interpolation=cv2.INTER_CUBIC)
-    
-    # 2. Grayscale & Contrast Enhancement (CLAHE)
-    gray = cv2.cvtColor(img_resized, cv2.COLOR_RGB2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast = clahe.apply(gray)
-    
-    # 3. Clean Sharp Binarization (Otsu threshold)
-    thresh = cv2.threshold(contrast, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-    
-    # Standard Cattle Feed Material Columns
-    known_columns = [
-        "POS_Party", "MS10 M", "MS10 P", "MS18 M", "MS18 P", "MS30", 
-        "BC10", "BC18", "MSSP+", "HC", "TF", "CB", "PC-60", "C/G", 
-        "SHAKTI MSH", "BC-30", "MS-55", "PS"
-    ]
-    
-    # 4. Tesseract OCR with Table Mode (--psm 6)
-    raw_text = pytesseract.image_to_string(thresh, config='--oem 3 --psm 6')
-    extracted_rows = []
-    lines = [ln.strip() for ln in raw_text.splitlines() if ln.strip()]
-    
-    for line_str in lines:
-        upper_line = line_str.upper()
-        # Header aur footer summary rows ignore karein
-        if any(keyword in upper_line for keyword in ["DHULE", "TOTAL", "RECEIVED", "ACCOUNTS", "MOBILE", "NAME", "SR NO"]):
-            continue
-            
-        # Party / DR code / POS dhoondhna
-        pos_search = re.search(r'(DR\s*[-_]?\s*\d+|POS\s*[-_]?\s*\d+|[A-Za-z]{3,}\s*(?:Traders|Feed|Pashu))', line_str, re.IGNORECASE)
-        
-        # Line me saare positive numbers collect karna
-        all_numbers = [int(n) for n in re.findall(r'\b\d+\b', line_str) if 0 < int(n) <= 650]
-        
-        if pos_search or len(all_numbers) >= 2:
-            party_name = pos_search.group(0).replace(" ", "").upper() if pos_search else f"Party_{len(extracted_rows)+1}"
-            
-            # Party code ke digits ko quantity se exclude karna (jaise DR19172 se 19172)
-            party_digits = re.findall(r'\d+', party_name)
-            if party_digits:
-                p_num = int(party_digits[0])
-                if p_num in all_numbers:
-                    all_numbers.remove(p_num)
-                    
-            if all_numbers:
-                row_dict = {"POS_Party": party_name}
-                for c in known_columns[1:]:
-                    row_dict[c] = 0
-                
-                # Extracted numbers ko sequential material columns me place karna
-                for idx, val in enumerate(all_numbers):
-                    if idx + 1 < len(known_columns):
-                        row_dict[known_columns[idx + 1]] = val
-                        
-                extracted_rows.append(row_dict)
-                
-    if extracted_rows:
-        return pd.DataFrame(extracted_rows)
-    else:
-        # Agar koi bhi row na mile toh blank structure dena
-        return pd.DataFrame([{c: ("" if c == "POS_Party" else 0) for c in known_columns}])
+# Fast Image Preprocessing
+def prepare_fast_image(uploaded_img):
+    img = Image.open(uploaded_img)
+    if img.mode in ("RGBA", "P"):
+        img = img.convert("RGB")
+    max_dimension = 1600
+    if max(img.size) > max_dimension:
+        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
+    buffer = io.BytesIO()
+    img.save(buffer, format="JPEG", quality=85, optimize=True)
+    buffer.seek(0)
+    return Image.open(buffer)
 
 # --- METHOD 1: EXCEL / CSV ---
 if upload_mode == "📄 Excel / CSV Upload":
@@ -96,24 +49,74 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: AUTO IMAGE TO TABLE CONVERSION ---
+# --- METHOD 2: IMAGE UPLOAD (LATEST GEMINI 2.5 FLASH ONLY) ---
 else:
-    img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
+    img_file = st.file_uploader("Demand Photo / Screenshot Upload Karein", type=["png", "jpg", "jpeg"])
     
     if img_file:
-        pil_img = Image.open(img_file)
-        st.image(pil_img, caption="Uploaded Demand Sheet", use_container_width=True)
+        processed_img = prepare_fast_image(img_file)
+        st.image(processed_img, caption="Uploaded Demand Sheet", use_container_width=True)
         
-        if st.button("⚡ Image Se Table Auto-Convert Karein", type="primary"):
-            with st.spinner("Image scan karke table convert kiya ja raha hai..."):
-                converted_df = extract_table_from_image(pil_img)
-                st.session_state["auto_table_df"] = converted_df
-                st.success("Image table me convert ho gayi!")
+        if st.button("⚡ Image Se Table Generate Karein", type="primary"):
+            if not api_key:
+                st.error("Kripya sidebar me Gemini API Key dalein.")
+            else:
+                with st.spinner("Latest Gemini AI table scan kar raha hai..."):
+                    client = genai.Client(api_key=api_key)
+                    prompt = """
+                    You are an expert tabular demand data parser.
+                    Extract customer rows from this demand sheet.
+                    
+                    Headers in the sheet typically include:
+                    - Customer details / POS / DR code
+                    - Material columns: MS10 M, MS10 P, MS18 M, MS18 P, MS30, BC10, BC18, MSSP+, HC, TF, CB, PC-60, C/G, SHAKTI MSH, BC-30, MS-55, PS, etc.
+                    
+                    Instructions:
+                    1. Ignore summary rows like 'DHULE' or 'TOTAL'.
+                    2. For each party row:
+                       - 'POS_Party': Extract customer name or DR/POS code (e.g. 'DR19172', 'DR17032', 'POS4146').
+                       - Map numeric bags under their respective material header keys (only values > 0).
+                    3. Return ONLY a valid JSON array of objects.
+                    """
+                    
+                    response = None
+                    last_err = None
+                    
+                    # Sirf Latest Model: gemini-2.5-flash (with retry for server spike)
+                    for attempt in range(3):
+                        try:
+                            response = client.models.generate_content(
+                                model="gemini-2.5-flash",
+                                contents=[prompt, processed_img],
+                                config=types.GenerateContentConfig(response_mime_type="application/json")
+                            )
+                            if response and response.text:
+                                break
+                        except Exception as ex:
+                            last_err = ex
+                            time.sleep(2)
 
-    if "auto_table_df" in st.session_state and upload_mode == "📸 Image Upload (Auto Table Conversion)":
-        st.subheader("📋 Image Se Auto-Convert Hua Data Table")
-        st.caption("Aap kisi bhi cell ki quantity ko click karke seedhe theek ya verify kar sakte hain:")
-        edited_df = st.data_editor(st.session_state["auto_table_df"], num_rows="dynamic", use_container_width=True)
+                    if response and response.text:
+                        try:
+                            clean_text = response.text.strip()
+                            if clean_text.startswith("```json"):
+                                clean_text = clean_text[7:-3].strip()
+                            elif clean_text.startswith("```"):
+                                clean_text = clean_text[3:-3].strip()
+                                
+                            parsed_json = json.loads(clean_text)
+                            extracted_df = pd.DataFrame(parsed_json).fillna(0)
+                            st.session_state["extracted_df"] = extracted_df
+                            st.success("Table extract ho gaya!")
+                        except Exception as pe:
+                            st.error(f"JSON Parse Error: {pe}")
+                    else:
+                        st.error(f"Error: {last_err}")
+
+    if "extracted_df" in st.session_state and upload_mode == "📸 Image Upload (AI Auto-Scan)":
+        st.subheader("📋 Image Se Auto-Extract Hua Data (Editable)")
+        st.caption("Aap kisi bhi cell ki quantity ko click karke direct verify ya theek kar sakte hain:")
+        edited_df = st.data_editor(st.session_state["extracted_df"], num_rows="dynamic", use_container_width=True)
         df = edited_df
 
 # --- CORE LOGIC & LOADING SEQUENCE GENERATION ---
@@ -229,7 +232,7 @@ if df is not None and not df.empty:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity values inside cell (Only numbers, No strings/POS)
+                            # Clean quantity (Only numeric values, no POS/DR text)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"
@@ -242,7 +245,7 @@ if df is not None and not df.empty:
                             
             result_df = pd.DataFrame(plan_rows)
             
-            # Summary Table
+            # Party Position Summary Table
             st.markdown("---")
             st.subheader("📌 Party Wise Gaadi Me Location")
             summary_data = []

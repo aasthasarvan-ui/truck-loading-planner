@@ -82,7 +82,6 @@ else:
                     response = None
                     last_err = None
                     
-                   # Sirf Latest Model: gemini-3.8-flash (with retry for server spike)
                     for attempt in range(3):
                         try:
                             response = client.models.generate_content(
@@ -169,7 +168,6 @@ if df is not None and not df.empty:
             num_lines = int(num_lines)
             
             if position_mode == "Delivery Sequence (Drop Order)":
-                # LIFO rule: Aakhri drop Cabin me (Line 1), Pehla drop Gate pe (Last line)
                 loading_order = list(reversed(delivery_order))
             else:
                 zone_priority = {
@@ -200,7 +198,7 @@ if df is not None and not df.empty:
                     "Position": get_line_label(line_idx, num_lines)
                 }
                 for m in material_cols:
-                    row_dict[m] = ""
+                    row_dict[m] = 0
                 row_dict["Total Bags"] = 0
                 plan_rows.append(row_dict)
                 
@@ -232,18 +230,32 @@ if df is not None and not df.empty:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity (Only numeric values, no POS/DR text)
-                            existing = plan_rows[curr_line][m]
-                            if existing:
-                                plan_rows[curr_line][m] = f"{existing} + {fill}"
-                            else:
-                                plan_rows[curr_line][m] = str(fill)
+                            # DIRECT NUMERIC ADDITION: 42 + 30 text ke badle direct sum 72 banega
+                            plan_rows[curr_line][m] += fill
                                 
                             plan_rows[curr_line]["Total Bags"] += fill
                             curr_filled += fill
                             qty -= fill
                             
             result_df = pd.DataFrame(plan_rows)
+            
+            # --- NICHE TOTAL ROW BANANA ---
+            total_row = {"Line No.": "TOTAL", "Position": "All Lines"}
+            for m in material_cols:
+                total_row[m] = int(result_df[m].sum())
+            total_row["Total Bags"] = int(result_df["Total Bags"].sum())
+            
+            # 0 values ko table display me blank dikhana (clean look)
+            display_df = result_df.copy()
+            for m in material_cols:
+                display_df[m] = display_df[m].apply(lambda x: int(x) if x > 0 else "")
+                
+            display_total_row = total_row.copy()
+            for m in material_cols:
+                display_total_row[m] = int(display_total_row[m]) if display_total_row[m] > 0 else ""
+                
+            # Append total row to display table
+            final_table = pd.concat([display_df, pd.DataFrame([display_total_row])], ignore_index=True)
             
             # Party Position Summary Table
             st.markdown("---")
@@ -258,10 +270,10 @@ if df is not None and not df.empty:
                 })
             st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 
-            # Final Clean Loading Chart
+            # Final Clean Loading Chart with Bottom Total
             st.markdown("---")
             st.subheader("🚛 Final Line-Wise Loading Chart")
-            st.dataframe(result_df, use_container_width=True)
+            st.dataframe(final_table, use_container_width=True)
             
-            csv = result_df.to_csv(index=False).encode('utf-8')
+            csv = final_table.to_csv(index=False).encode('utf-8')
             st.download_button("📥 Download Loading Plan (CSV)", csv, "Loading_Plan.csv", "text/csv")

@@ -1,45 +1,22 @@
 import streamlit as st
 import pandas as pd
 import math
-import json
 import io
 from PIL import Image
-from google import genai
-from google.genai import types
 
 st.set_page_config(page_title="Truck Loading Planner", layout="wide")
-st.title("🚚 Truck Loading Sequence Planner")
+st.title("🚚 Truck Loading Sequence Planner (No API / Offline)")
 
-# Sidebar Settings
-st.sidebar.header("⚙️ Settings & API")
-api_key = st.sidebar.text_input("Gemini API Key:", type="password")
-if not api_key:
-    import os
-    api_key = os.environ.get("GEMINI_API_KEY", "")
-
-# 1. Inputs (Khali placeholders, koi default value nahi)
+# 1. Gaadi Inputs (No pre-filled defaults)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
 with col2:
     num_lines = st.number_input("Gaadi Me Total Lines/Bays:", min_value=1, value=None, placeholder="Total Lines dalein...")
 
-upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📄 Excel / CSV Upload", "📸 Image Upload (Photo)"], horizontal=True)
+upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📄 Excel / CSV Upload", "📸 Image / Direct Demand Entry"], horizontal=True)
 
 df = None
-
-# Fast Image Compression Helper (Upload fast aur smooth banane ke liye)
-def prepare_fast_image(uploaded_img):
-    img = Image.open(uploaded_img)
-    if img.mode in ("RGBA", "P"):
-        img = img.convert("RGB")
-    max_dimension = 1400
-    if max(img.size) > max_dimension:
-        img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
-    buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=80, optimize=True)
-    buffer.seek(0)
-    return Image.open(buffer)
 
 # --- METHOD 1: EXCEL / CSV ---
 if upload_mode == "📄 Excel / CSV Upload":
@@ -47,54 +24,52 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: IMAGE UPLOAD (SIRF GEMINI 3.8 FLASH) ---
+# --- METHOD 2: DIRECT / IMAGE ENTRY (100% NO GEMINI / NO API) ---
 else:
-    img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
+    st.info("💡 Photo dekh kar direct quantity bharein ya neeche photo upload karke side-by-side verify karein.")
+    img_file = st.file_uploader("Reference Demand Photo Upload Karein (Optional)", type=["png", "jpg", "jpeg"])
+    
+    col_img, col_table = st.columns([1, 1.2])
+    
     if img_file:
-        processed_img = prepare_fast_image(img_file)
-        st.image(processed_img, caption="Uploaded Demand Image", use_container_width=True)
+        with col_img:
+            image = Image.open(img_file)
+            st.image(image, caption="Uploaded Demand Reference", use_container_width=True)
+            
+    with col_table:
+        st.subheader("Demand Entry Grid")
+        st.caption("Aap row add/delete kar sakte hain aur material bag quantities direct edit kar sakte hain:")
         
-        if st.button("🔍 Scan & Extract Data From Image"):
-            if not api_key:
-                st.error("Kripya sidebar me Gemini API Key dalein.")
-            else:
-                with st.spinner("Gemini 3.8 Flash photo scan kar raha hai..."):
-                    try:
-                        client = genai.Client(api_key=api_key)
-                        prompt = """
-                        Extract tabular demand data from this image.
-                        Return ONLY a valid JSON array of objects.
-                        Each object must contain:
-                        - 'POS_Party': Customer identifier / POS name.
-                        - Product column names as keys with integer bag quantities (> 0).
-                        Exclude any totals or empty items.
-                        """
-                        
-                        # Sirf Gemini 3.8 Flash
-                        response = client.models.generate_content(
-                            model="gemini-3.8-flash",
-                            contents=[prompt, processed_img],
-                            config=types.GenerateContentConfig(response_mime_type="application/json")
-                        )
+        # Pre-structured columns matching standard cattle feed products
+        default_data = {
+            "POS_Party": ["DR17032", "POS4146", "POS4083", "POS4179"],
+            "MS18 P": [0, 10, 0, 10],
+            "MS30": [115, 0, 100, 45],
+            "MSSP+": [0, 0, 0, 55],
+            "HC": [0, 25, 0, 30],
+            "TF": [25, 30, 50, 30],
+            "CB": [0, 20, 0, 0],
+            "PC-60": [10, 15, 0, 10],
+            "C/G": [0, 10, 0, 20]
+        }
+        
+        # Interactive Streamlit Data Editor (No API needed, instant & fast)
+        edited_df = st.data_editor(
+            pd.DataFrame(default_data), 
+            num_rows="dynamic",
+            use_container_width=True
+        )
+        if st.button("Confirm & Use This Demand Data"):
+            st.session_state["manual_df"] = edited_df
+            st.success("Demand data set ho gaya!")
 
-                        if response and response.text:
-                            parsed_json = json.loads(response.text)
-                            df = pd.DataFrame(parsed_json).fillna(0)
-                            st.session_state["extracted_df"] = df
-                            st.success("Data successfully extract ho gaya!")
-                        else:
-                            st.error("Model se koi response nahi mila.")
+if "manual_df" in st.session_state and upload_mode == "📸 Image / Direct Demand Entry":
+    df = st.session_state["manual_df"]
 
-                    except Exception as e:
-                        st.error(f"Image scan karne me error: {e}")
-
-if "extracted_df" in st.session_state and upload_mode == "📸 Image Upload (Photo)":
-    df = st.session_state["extracted_df"]
-
-# --- CORE LOGIC & TABLE GENERATION ---
+# --- CORE LOGIC & LOADING SEQUENCE GENERATION ---
 if df is not None:
     st.markdown("---")
-    st.subheader("📋 Demand Table")
+    st.subheader("📋 Active Demand Table")
     st.dataframe(df, use_container_width=True)
     
     party_col = st.selectbox("POS / Party Column Chunein:", df.columns, index=0)
@@ -186,7 +161,7 @@ if df is not None:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # Clean quantity values inside cell (No strings / No POS / No DRCODE)
+                            # Clean quantity values inside cell (Zero Strings, Only numbers)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"

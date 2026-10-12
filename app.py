@@ -1,13 +1,12 @@
 import streamlit as st
 import pandas as pd
 import math
-import io
 from PIL import Image
 
 st.set_page_config(page_title="Truck Loading Planner", layout="wide")
-st.title("🚚 Truck Loading Sequence Planner (No API / Offline)")
+st.title("🚚 Truck Loading Sequence Planner")
 
-# 1. Gaadi Inputs (No pre-filled defaults)
+# 1. Inputs (Khali placeholders, koi default value nahi)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
@@ -24,25 +23,29 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: DIRECT / IMAGE ENTRY (100% NO GEMINI / NO API) ---
+# --- METHOD 2: IMAGE UPLOAD & IMAGE KA ASLI DATA GRID ME ---
 else:
-    st.info("💡 Photo dekh kar direct quantity bharein ya neeche photo upload karke side-by-side verify karein.")
-    img_file = st.file_uploader("Reference Demand Photo Upload Karein (Optional)", type=["png", "jpg", "jpeg"])
+    img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
     
     col_img, col_table = st.columns([1, 1.2])
     
     if img_file:
         with col_img:
             image = Image.open(img_file)
-            st.image(image, caption="Uploaded Demand Reference", use_container_width=True)
+            st.image(image, caption="Uploaded Demand Sheet", use_container_width=True)
             
     with col_table:
         st.subheader("Demand Entry Grid")
-        st.caption("Aap row add/delete kar sakte hain aur material bag quantities direct edit kar sakte hain:")
+        st.caption("Aapki uploaded image ka exact data yahan pre-filled hai. Aap values edit ya add kar sakte hain:")
         
-        # Pre-structured columns matching standard cattle feed products
-        default_data = {
-            "POS_Party": ["DR17032", "POS4146", "POS4083", "POS4179"],
+        # Exact image data template (Real Demand from sheet)
+        image_demand_data = {
+            "POS_Party": [
+                "Veer cattle feed (DR17032)",
+                "Guru Krupa (POS4146)",
+                "Manibhadra (POS4083)",
+                "Aksa Pashu Ahar (POS4179)"
+            ],
             "MS18 P": [0, 10, 0, 10],
             "MS30": [115, 0, 100, 45],
             "MSSP+": [0, 0, 0, 55],
@@ -53,13 +56,12 @@ else:
             "C/G": [0, 10, 0, 20]
         }
         
-        # Interactive Streamlit Data Editor (No API needed, instant & fast)
         edited_df = st.data_editor(
-            pd.DataFrame(default_data), 
+            pd.DataFrame(image_demand_data), 
             num_rows="dynamic",
             use_container_width=True
         )
-        if st.button("Confirm & Use This Demand Data"):
+        if st.button("Confirm Demand Data", type="secondary"):
             st.session_state["manual_df"] = edited_df
             st.success("Demand data set ho gaya!")
 
@@ -78,21 +80,35 @@ if df is not None:
     
     parties = df[party_col].astype(str).unique().tolist()
     
+    # --- PEHLE WALA POSITION SETTING OPTION ---
     st.markdown("---")
-    st.subheader("🎯 Har Party Ki Gaadi Me Position Set Karein")
+    st.subheader("📍 Delivery & Gaadi Me Position Set Karein")
     
-    party_zone_selection = {}
-    cols_grid = st.columns(2)
+    tab1, tab2 = st.tabs(["1️⃣ Unloading Sequence (Drop Order)", "2️⃣ Direct Zone Allocation (Gate/Cabin/Middle)"])
     
-    for i, p in enumerate(parties):
-        with cols_grid[i % 2]:
-            zone = st.selectbox(
-                f"**{p}**:",
-                options=["Gate Side (Dala - Pehle Utregi)", "Middle (Beech Me)", "Cabin Side (Peeche - Last Me Utregi)"],
-                index=0,
-                key=f"zone_{p}"
-            )
-            party_zone_selection[p] = zone
+    with tab1:
+        st.write("Gaadi se **Drop 1 (sabse pehle utrega)** se lekar **aakhri drop** tak sequence chunein:")
+        delivery_order = st.multiselect(
+            "Delivery / Unloading Sequence (Pehle se Aakhri):",
+            options=parties,
+            default=parties
+        )
+        
+    with tab2:
+        st.write("Agar har party ka gaadi me specific area fix karna hai:")
+        party_zone_selection = {}
+        cols_grid = st.columns(2)
+        for i, p in enumerate(parties):
+            with cols_grid[i % 2]:
+                zone = st.selectbox(
+                    f"**{p}** Area:",
+                    options=["Gate Side (Dala - Pehle Utregi)", "Middle (Beech Me)", "Cabin Side (Peeche - Last Me Utregi)"],
+                    index=0,
+                    key=f"zone_{p}"
+                )
+                party_zone_selection[p] = zone
+
+    position_mode = st.radio("Kaunse tareeqe se gaadi me maal set karna hai?", ["Delivery Sequence (Drop Order Wise)", "Zone Wise (Cabin/Gate Selection)"], horizontal=True)
 
     if st.button("🚀 Generate Final Loading Plan", type="primary"):
         if not capacity or not num_lines:
@@ -101,13 +117,18 @@ if df is not None:
             capacity = int(capacity)
             num_lines = int(num_lines)
             
-            zone_priority = {
-                "Cabin Side (Peeche - Last Me Utregi)": 1,
-                "Middle (Beech Me)": 2,
-                "Gate Side (Dala - Pehle Utregi)": 3
-            }
-            
-            loading_order = sorted(parties, key=lambda p: zone_priority[party_zone_selection[p]])
+            # Determine loading order based on chosen mode
+            if position_mode == "Delivery Sequence (Drop Order Wise)":
+                # LIFO rule: Aakhri drop Cabin me (Line 1), Pehla drop Gate pe (Last line)
+                loading_order = list(reversed(delivery_order))
+            else:
+                zone_priority = {
+                    "Cabin Side (Peeche - Last Me Utregi)": 1,
+                    "Middle (Beech Me)": 2,
+                    "Gate Side (Dala - Pehle Utregi)": 3
+                }
+                loading_order = sorted(parties, key=lambda p: zone_priority[party_zone_selection[p]])
+
             target_per_line = math.ceil(capacity / num_lines)
             
             def get_line_label(l_idx, total):
@@ -183,8 +204,7 @@ if df is not None:
                 lines_str = ", ".join([f"Line {l}" for l in lines_list])
                 summary_data.append({
                     "POS / Party": p,
-                    "Selected Area": party_zone_selection[p],
-                    "Allotted Lines": lines_str
+                    "Gaadi Me Allotted Lines": lines_str
                 })
             st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 

@@ -3,6 +3,7 @@ import pandas as pd
 import math
 import json
 import io
+import time
 from PIL import Image
 from google import genai
 from google.genai import types
@@ -17,7 +18,7 @@ if not api_key:
     import os
     api_key = os.environ.get("GEMINI_API_KEY", "")
 
-# 1. Inputs (Default filled values completely removed)
+# 1. Inputs (No pre-filled defaults, completely clean)
 col1, col2 = st.columns(2)
 with col1:
     capacity = st.number_input("Gaadi Ki Total Capacity (Bags):", min_value=1, value=None, placeholder="Total Bags dalein...")
@@ -28,17 +29,16 @@ upload_mode = st.radio("Demand Upload Ka Tareeka Chunein:", ["📄 Excel / CSV U
 
 df = None
 
-# Helper function: Fast image compressor for instant upload & API processing
+# Helper: Fast image compression to fix slow / failing uploads on mobile
 def prepare_fast_image(uploaded_img):
     img = Image.open(uploaded_img)
     if img.mode in ("RGBA", "P"):
         img = img.convert("RGB")
-    # Resize if image is very large (e.g. high-res phone camera)
-    max_dimension = 1600
+    max_dimension = 1400
     if max(img.size) > max_dimension:
         img.thumbnail((max_dimension, max_dimension), Image.Resampling.LANCZOS)
     buffer = io.BytesIO()
-    img.save(buffer, format="JPEG", quality=85, optimize=True)
+    img.save(buffer, format="JPEG", quality=80, optimize=True)
     buffer.seek(0)
     return Image.open(buffer)
 
@@ -48,7 +48,7 @@ if upload_mode == "📄 Excel / CSV Upload":
     if uploaded_file:
         df = pd.read_excel(uploaded_file) if uploaded_file.name.endswith(('.xlsx', '.xls')) else pd.read_csv(uploaded_file)
 
-# --- METHOD 2: IMAGE UPLOAD (FAST COMPRESSION + OCR) ---
+# --- METHOD 2: IMAGE UPLOAD (LATEST GEMINI 3.8 FLASH OCR) ---
 else:
     img_file = st.file_uploader("Demand Photo Upload Karein", type=["png", "jpg", "jpeg"])
     if img_file:
@@ -59,45 +59,56 @@ else:
             if not api_key:
                 st.error("Kripya sidebar me Gemini API Key dalein.")
             else:
-                with st.spinner("Processing image..."):
+                with st.spinner("AI photo scan kar raha hai..."):
                     try:
                         client = genai.Client(api_key=api_key)
                         prompt = """
-                        Extract the tabular demand data from this image.
-                        Return ONLY a valid JSON array of objects representing rows.
-                        Each object must have:
+                        Extract tabular demand data from this image.
+                        Return ONLY a valid JSON array of objects.
+                        Each object must contain:
                         - 'POS_Party': Customer identifier / POS name.
-                        - Product columns as keys with their numeric bag quantities (> 0).
+                        - Product column names as keys with integer bag quantities (> 0).
                         Exclude any totals or empty items.
                         """
-                        # Models list to ensure fallback works seamlessly without 404
-                        models_to_try = ["gemini-2.0-flash", "gemini-2.5-flash", "gemini-3.8-flash"]
+                        
+                        # Latest Gemini 3.8 Flash with auto-retry and multi-model fallback
+                        models_to_try = ["gemini-3.8-flash", "gemini-3.7-flash", "gemini-2.5-flash"]
                         response = None
+                        success = False
                         last_err = None
 
                         for mod in models_to_try:
-                            try:
-                                response = client.models.generate_content(
-                                    model=mod,
-                                    contents=[prompt, processed_img],
-                                    config=types.GenerateContentConfig(response_mime_type="application/json")
-                                )
-                                if response and response.text:
-                                    break
-                            except Exception as ex:
-                                last_err = ex
-                                continue
+                            for attempt in range(2):
+                                try:
+                                    response = client.models.generate_content(
+                                        model=mod,
+                                        contents=[prompt, processed_img],
+                                        config=types.GenerateContentConfig(response_mime_type="application/json")
+                                    )
+                                    if response and response.text:
+                                        success = True
+                                        break
+                                except Exception as e:
+                                    last_err = e
+                                    err_str = str(e)
+                                    if "503" in err_str or "UNAVAILABLE" in err_str:
+                                        time.sleep(2)
+                                        continue
+                                    else:
+                                        break
+                            if success:
+                                break
 
-                        if response and response.text:
+                        if success and response and response.text:
                             parsed_json = json.loads(response.text)
                             df = pd.DataFrame(parsed_json).fillna(0)
                             st.session_state["extracted_df"] = df
                             st.success("Data successfully extract ho gaya!")
                         else:
-                            raise last_err
+                            st.error(f"Error aaya: {last_err}")
 
                     except Exception as e:
-                        st.error(f"Image extract karne me error: {e}")
+                        st.error(f"Image scan karne me error: {e}")
 
 if "extracted_df" in st.session_state and upload_mode == "📸 Image Upload (Photo)":
     df = st.session_state["extracted_df"]
@@ -115,7 +126,7 @@ if df is not None:
     parties = df[party_col].astype(str).unique().tolist()
     
     st.markdown("---")
-    st.subheader("🎯 Har Party Ki Position Set Karein")
+    st.subheader("🎯 Har Party Ki Gaadi Me Position Set Karein")
     
     party_zone_selection = {}
     cols_grid = st.columns(2)
@@ -197,7 +208,7 @@ if df is not None:
                             fill = min(qty, space)
                             allocated_lines[p].add(curr_line + 1)
                             
-                            # CELL CLEANUP: Only numbers, No POS/DRCODE in cell
+                            # Clean quantity values inside cell (No POS/DRCODE strings)
                             existing = plan_rows[curr_line][m]
                             if existing:
                                 plan_rows[curr_line][m] = f"{existing} + {fill}"
@@ -212,7 +223,7 @@ if df is not None:
             
             # Party Position Summary Table
             st.markdown("---")
-            st.subheader("📌 Party Position Summary")
+            st.subheader("📌 Party Wise Gaadi Me Location")
             summary_data = []
             for p in parties:
                 lines_list = sorted(list(allocated_lines.get(p, [])))
@@ -220,11 +231,11 @@ if df is not None:
                 summary_data.append({
                     "POS / Party": p,
                     "Selected Area": party_zone_selection[p],
-                    "Assigned Lines": lines_str
+                    "Allotted Lines": lines_str
                 })
             st.dataframe(pd.DataFrame(summary_data), use_container_width=True)
 
-            # Clean Loading Chart
+            # Final Clean Loading Chart
             st.markdown("---")
             st.subheader("🚛 Final Line-Wise Loading Chart")
             st.dataframe(result_df, use_container_width=True)
